@@ -1028,9 +1028,10 @@ void EasyCommandHandle::follow_new_path(
     }
   }
 
+  const auto current_location = context->location();
   if (!opt_initial_map.has_value())
   {
-    for (const auto& l : context->location())
+    for (const auto& l : current_location)
     {
       opt_initial_map = graph.get_waypoint(l.waypoint()).get_map_name();
       break;
@@ -1051,7 +1052,6 @@ void EasyCommandHandle::follow_new_path(
   std::string initial_map = *opt_initial_map;
 
   std::vector<EasyFullControl::CommandExecution> queue;
-  const auto& current_location = context->location();
 
   bool found_connection = false;
   std::size_t i0 = 0;

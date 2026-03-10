@@ -512,6 +512,18 @@ void GoToPlace::Active::_find_plan()
     return;
   }
 
+  const auto location = _context->location();
+  if (location.size() == 0)
+  {
+    RCLCPP_ERROR(
+      _context->node()->get_logger(),
+      "Robot [%s] is lost while trying to find a plan.",
+      _context->requester_id().c_str());
+
+    _schedule_retry();
+    return;
+  }
+
   _state->update_status(Status::Underway);
   const auto start_name = wp_name(*_context);
   const auto goal_name = wp_name(*_context, *_chosen_goal);
@@ -522,7 +534,7 @@ void GoToPlace::Active::_find_plan()
   std::stringstream ss;
   ss << "Planning for [" << _context->requester_id()
      << "] to [" << goal_name << "] from one of these locations:"
-     << agv::print_starts(_context->location(), graph);
+     << agv::print_starts(location, graph);
 
   RCLCPP_INFO(
     _context->node()->get_logger(),
@@ -531,7 +543,7 @@ void GoToPlace::Active::_find_plan()
 
   // TODO(MXG): Make the planning time limit configurable
   _find_path_service = std::make_shared<services::FindPath>(
-    _context->planner(), _context->location(), *_chosen_goal,
+    _context->planner(), location, *_chosen_goal,
     _context->schedule()->snapshot(), _context->itinerary().id(),
     _context->profile(),
     std::chrono::seconds(5));
@@ -656,7 +668,8 @@ void GoToPlace::Active::_execute_plan(
 
     const auto& graph = _context->navigation_graph();
     _context->retain_mutex_groups(
-      {graph.get_waypoint(goal.waypoint()).in_mutex_group()});
+      {graph.get_waypoint(goal.waypoint()).in_mutex_group()},
+      "empty plan");
 
     _finished();
     return;
