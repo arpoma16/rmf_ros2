@@ -100,6 +100,16 @@ public:
     void _schedule(rmf_traffic::schedule::Itinerary itinerary) const;
     void _apply_cumulative_delay();
     bool _consider_plan_result(services::FindPath::Result result);
+    /// While waiting for the lock, the robot may stand on the only way out of
+    /// the group (e.g. the junction of a dead-end station). If the itinerary of
+    /// a robot that holds one of the awaited groups runs into the waiting
+    /// robot, give way once: drop the stubbornness and replan, so the planner
+    /// moves this robot out of that path.
+    /// Known limitation: the detour of the new plan ends outside the group, so
+    /// its MoveRobot finish drops the pending request and the robot asks again
+    /// (new claim time) when it comes back. With 3+ robots another requester of
+    /// the same group may get ahead of it.
+    void _give_way_if_blocking();
     agv::RobotContextPtr _context;
     rmf_task::events::SimpleEventStatePtr _state;
     std::function<void()> _finished;
@@ -112,6 +122,10 @@ public:
     std::shared_ptr<services::FindPath> _find_path_service;
     rclcpp::TimerBase::SharedPtr _find_path_timeout;
     std::shared_ptr<std::size_t> _current_event_waypoint;
+    rmf_rxcpp::subscription_guard _holder_listener;
+    std::unordered_set<rmf_traffic::ParticipantId> _holders;
+    rmf_traffic::Time _wait_start;
+    bool _gave_way = false;
   };
 };
 

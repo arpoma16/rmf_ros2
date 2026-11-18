@@ -18,8 +18,18 @@
 #include "LockMutexGroup.hpp"
 #include <iostream>
 
+#include <rmf_traffic/DetectConflict.hpp>
+
 namespace rmf_fleet_adapter {
 namespace events {
+
+namespace {
+// How far ahead the itinerary of a robot holding an awaited mutex group is
+// checked against the position of the waiting robot.
+const rmf_traffic::Duration GiveWayHorizon = std::chrono::seconds(60);
+// Let the hold settle before checking whether this robot is in the way.
+const rmf_traffic::Duration GiveWaySettle = std::chrono::seconds(2);
+} // anonymous namespace
 
 //==============================================================================
 std::string all_str(const std::unordered_set<std::string>& all)
@@ -208,6 +218,32 @@ void LockMutexGroup::Active::_initialize()
 
   const auto cumulative_delay = _context->now() - _data.hold_time;
   _context->itinerary().cumulative_delay(*_data.plan_id, cumulative_delay);
+  _wait_start = _context->now();
+
+  // Track who holds the groups we are waiting for, to give way to them.
+  _holder_listener = _context->node()->mutex_group_states()
+    .observe_on(rxcpp::identity_same_worker(_context->worker()))
+    .subscribe([w = weak_from_this()](
+        const agv::Node::MutexGroupStates::SharedPtr& msg)
+      {
+        const auto self = w.lock();
+        if (!self)
+          return;
+
+        self->_holders.clear();
+        const auto me = self->_context->participant_id();
+        for (const auto& assignment : msg->assignments)
+        {
+          if (self->_remaining.count(assignment.group) == 0)
+            continue;
+
+          if (assignment.claimant == me
+          || assignment.claimant == (uint64_t)(-1))
+            continue;
+
+          self->_holders.insert(assignment.claimant);
+        }
+      });
 
   _delay_timer = _context->node()->try_create_wall_timer(
     std::chrono::seconds(1),
@@ -218,6 +254,12 @@ void LockMutexGroup::Active::_initialize()
         return;
 
       self->_apply_cumulative_delay();
+      self->_context->worker().schedule(
+        [w = self->weak_from_this()](const auto&)
+        {
+          if (const auto active = w.lock())
+            active->_give_way_if_blocking();
+        });
     });
 
   _listener = _context->request_mutex_groups(
@@ -348,6 +390,69 @@ void LockMutexGroup::Active::_apply_cumulative_delay()
 {
   const auto cumulative_delay = _context->now() - _data.hold_time;
   _context->itinerary().cumulative_delay(*_data.plan_id, cumulative_delay);
+}
+
+//==============================================================================
+void LockMutexGroup::Active::_give_way_if_blocking()
+{
+  if (_gave_way || !_finished || _remaining.empty() || _holders.empty())
+    return;
+
+  const auto now = _context->now();
+  if (now - _wait_start < GiveWaySettle)
+    return;
+
+  const auto& profile = _context->profile();
+  if (!profile)
+    return;
+
+  // The waiting robot as it is: standing where it is now.
+  const Eigen::Vector3d p = _context->position();
+  rmf_traffic::Trajectory standing;
+  standing.insert(now, p, Eigen::Vector3d::Zero());
+  standing.insert(now + GiveWayHorizon, p, Eigen::Vector3d::Zero());
+
+  const auto& map = _context->map();
+  for (const auto holder : _holders)
+  {
+    const auto itinerary = _context->schedule()->get_itinerary(holder);
+    const auto description = _context->schedule()->get_participant(holder);
+    if (!itinerary.has_value() || !description)
+      continue;
+
+    for (const auto& route : *itinerary)
+    {
+      if (!route || route->map() != map || route->trajectory().size() < 2)
+        continue;
+
+      const auto conflict = rmf_traffic::DetectConflict::between(
+        *profile, standing, nullptr,
+        description->profile(), route->trajectory(), nullptr);
+      if (!conflict.has_value())
+        continue;
+
+      _gave_way = true;
+      const std::string holder_name = description->owner() + "/"
+        + description->name();
+      RCLCPP_INFO(
+        _context->node()->get_logger(),
+        "[%s] is waiting for mutex groups %s on the path of [%s], which holds "
+        "them: giving way and replanning",
+        _context->requester_id().c_str(),
+        _data.all_groups_str().c_str(),
+        holder_name.c_str());
+      _state->update_log().info(
+        "Giving way to [" + holder_name + "] while waiting for "
+        + _data.all_groups_str());
+
+      // Stop refusing negotiations and let the planner move this robot out of
+      // the holder's path; the new plan asks for the lock again when it comes
+      // back (see the header for the claim time limitation).
+      _stubborn = nullptr;
+      _context->request_replan();
+      return;
+    }
+  }
 }
 
 //==============================================================================
